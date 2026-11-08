@@ -259,7 +259,7 @@ jobs:
           QCOW2_URLS["manjaro"]="https://www.mediafire.com/file/ynn1o8flu6v8mhd/manjaro.7z"
           QCOW2_URLS["mint"]="https://www.mediafire.com/file/a4qyactev4kzc0q/mint.7z/"
           QCOW2_URLS["pop_os"]="https://www.mediafire.com/file/lbrebo479z4fq3g/pop_os.7z"
-          QCOW2_URLS["ubuntu"]="https://www.mediafire.com/file/m2x4f34hdxqfndd/ubuntu.7z"
+          QCOW2_URLS["ubuntu"]="https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
           QCOW2_URLS["Vista"]="https://www.mediafire.com/file/f9fqa9oupypugbo/Vista.7z"
           QCOW2_URLS["win7"]="https://www.mediafire.com/file/py5c5n111ns72x0/win7.7z"
           QCOW2_URLS["win8.1"]="https://www.mediafire.com/file/tn4ojkrkg2cbvcs/win8.1.7z"
@@ -372,7 +372,10 @@ jobs:
           fi
 
           EXT=$(file -b --mime-type "$FILE_PATH")
-          if [[ "$EXT" == *"iso"* && "$MODE" == "iso" ]]; then
+          if [[ "$SRC" == *.img || "$SRC" == *.qcow2 ]]; then
+            echo "Direct disk image detected - using it as ${VM}.qcow2"
+            sudo mv "$FILE_PATH" "$MNT_PATH/${VM}.qcow2"
+          elif [[ "$EXT" == *"iso"* && "$MODE" == "iso" ]]; then
             sudo mv "$FILE_PATH" "$HOME_PATH/${VM}.iso"
             sudo qemu-img create -f qcow2 "$MNT_PATH/${VM}.qcow2" "${DISK}G"
           elif [[ "$EXT" == *"iso"* && "$MODE" == "qcow2" ]]; then
@@ -411,6 +414,12 @@ jobs:
               fi
             fi
           fi
+          echo "Creating cloud-init seed (console login ubuntu/runner)..."
+          sudo apt-get install -y -qq cloud-image-utils > /dev/null 2>&1 || true
+          printf '%s\n' '#cloud-config' 'ssh_pwauth: true' 'chpasswd:' '  expire: false' '  list: |' '    ubuntu:runner' > /tmp/ci-user-data
+          printf 'instance-id: %s-%s\nlocal-hostname: %s\n' "$VM" "$(date +%s)" "$VM" > /tmp/ci-meta-data
+          sudo cloud-localds /mnt/seed.iso /tmp/ci-user-data /tmp/ci-meta-data
+
           sudo rm -rf "$TEMP_PATH"
 
           
@@ -444,6 +453,11 @@ jobs:
           VARS_PATH=./OVMF_VARS.fd
           echo "downloaded from gitlab new links"
 
+          SEED_ARG=""
+          if [ -f /mnt/seed.iso ]; then
+            SEED_ARG="-drive file=/mnt/seed.iso,media=cdrom,readonly=on"
+          fi
+
           if [ ! -f "$DISK_PATH" ]; then
             sudo qemu-img create -f qcow2 "$DISK_PATH" "${DISK}G" || true
           fi
@@ -455,6 +469,7 @@ jobs:
                 -cpu host \
                 -smp ${VCPUS} \
                 -m ${RAM}G \
+                $SEED_ARG \
                 -boot d \
                 -cdrom "$ISO_PATH" \
                 -drive if=none,id=hd0,file="$DISK_PATH",format=qcow2 \
@@ -477,6 +492,7 @@ jobs:
                 -cpu host \
                 -smp ${VCPUS} \
                 -m ${RAM}G \
+                $SEED_ARG \
                 -hda "$DISK_PATH" \
                 -drive if=pflash,format=raw,readonly=on,file="$CODE_PATH" \
                 -drive if=pflash,format=raw,file="$VARS_PATH" \
@@ -499,6 +515,7 @@ jobs:
                 -cpu host \
                 -smp ${VCPUS} \
                 -m ${RAM}G \
+                $SEED_ARG \
                 -boot d \
                 -cdrom "$ISO_PATH" \
                 -hda "$DISK_PATH" \
@@ -518,6 +535,7 @@ jobs:
                 -cpu host \
                 -smp ${VCPUS} \
                 -m ${RAM}G \
+                $SEED_ARG \
                 -hda "$DISK_PATH" \
                 -boot c \
                 -vnc :0,password=on \
