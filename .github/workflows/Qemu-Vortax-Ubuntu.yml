@@ -1,8 +1,5 @@
 name: Qemu-Vortax Ubuntu
 
-permissions:
-  contents: write
-
 on:
   workflow_dispatch:
     inputs:
@@ -52,7 +49,7 @@ on:
         default: ''
 
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 jobs:
