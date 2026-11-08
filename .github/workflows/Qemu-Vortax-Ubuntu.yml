@@ -1,5 +1,8 @@
 name: Qemu-Vortax Ubuntu
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
     inputs:
@@ -312,6 +315,8 @@ jobs:
           echo "VCPUS=$VCPUS" >> $GITHUB_ENV
           
       - name: Prepare files and disks
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           MODE="${{ github.event.inputs.boot_mode }}"
           SRC="${{ env.FINAL_SOURCE_URL }}"
@@ -337,6 +342,26 @@ jobs:
               echo "Error: No valid file found from archive.org"
               exit 1
             fi
+          elif [[ "$SRC" == release:* ]]; then
+            TAG="${SRC#release:}"
+            echo "Restoring disk from GitHub release state: $TAG"
+            sudo mkdir -p /mnt/dl
+            cd /mnt/dl
+            gh release download "$TAG" --clobber
+            FIRST=$(ls -1 "${VM}"-*.7z.001 2>/dev/null | head -n1 || true)
+            if [ -n "$FIRST" ]; then
+              sudo 7z x -y "$FIRST" -o/mnt >/dev/null
+            else
+              LAST=$(ls -1 "${VM}"-*.7z 2>/dev/null | head -n1 || true)
+              if [ -n "$LAST" ]; then sudo 7z x -y "$LAST" -o/mnt >/dev/null; fi
+            fi
+            if [ ! -f "/mnt/${VM}.qcow2" ]; then
+              echo "::error::Could not restore ${VM}.qcow2 from release tag $TAG"
+              exit 1
+            fi
+            echo "Restored /mnt/${VM}.qcow2 from release tag $TAG"
+            DIRECT=yes
+            cd "$HOME_PATH"
           elif [[ "$SRC" == *"mediafire.com"* || "$SRC" == *"mega.nz"* ]]; then
             echo "Using badown to download from: $SRC"
             cd ~/badown
@@ -371,6 +396,7 @@ jobs:
             sudo wget -q --user-agent="Mozilla/5.0" --trust-server-names --content-disposition -O "$FILE_PATH" "$SRC"
           fi
 
+          if [ "${DIRECT:-no}" != "yes" ]; then
           EXT=$(file -b --mime-type "$FILE_PATH")
           if [[ "$SRC" == *.img || "$SRC" == *.qcow2 ]]; then
             echo "Direct disk image detected - using it as ${VM}.qcow2"
@@ -414,6 +440,7 @@ jobs:
               fi
             fi
           fi
+          fi
           echo "Creating cloud-init seed (console login ubuntu/runner)..."
           sudo apt-get install -y -qq cloud-image-utils > /dev/null 2>&1 || true
           printf '%s\n' '#cloud-config' 'ssh_pwauth: true' 'chpasswd:' '  expire: false' '  list: |' '    ubuntu:runner' > /tmp/ci-user-data
@@ -443,9 +470,14 @@ jobs:
           DISK_PATH="$MNT_PATH/${VM}.qcow2"
 
           PUBPORT="${{ github.event.inputs.public_port }}"
+          HOSTPORT="$PUBPORT"
           NETDEV="user,id=net0"
-          if [ -n "$PUBPORT" ]; then NETDEV="$NETDEV,hostfwd=tcp::${PUBPORT}-:${PUBPORT}"; fi
-          echo "Public port: ${PUBPORT:-none}"
+          if [ -n "$PUBPORT" ]; then
+            if [ "$PUBPORT" -lt 1024 ]; then HOSTPORT=$((PUBPORT+10000)); fi
+            NETDEV="$NETDEV,hostfwd=tcp::${HOSTPORT}-:${PUBPORT}"
+            echo "PUBPORT_HOST=$HOSTPORT" >> $GITHUB_ENV
+          fi
+          echo "Public port: ${PUBPORT:-none} (host port ${HOSTPORT:-none})"
 
           wget -q https://gitlab.com/MR.English2008/qemu-pre-build-ovfm.fd-files/-/raw/main/OVMF_CODE.fd -O OVMF_CODE.fd
           wget -q https://gitlab.com/MR.English2008/qemu-pre-build-ovfm.fd-files/-/raw/main/OVMF_VARS.fd -O OVMF_VARS.fd
@@ -649,10 +681,11 @@ jobs:
           fi
 
           PUBPORT="${{ github.event.inputs.public_port }}"
+          HOSTPORT="${PUBPORT_HOST:-$PUBPORT}"
           PUBURL=""
           if [ -n "$PUBPORT" ] && [ "$PUBPORT" != "$PORT" ]; then
-            echo "Starting public tunnel for port $PUBPORT ..."
-            nohup bore local $PUBPORT --to bore.pub > bore_pub_log.log 2>&1 &
+            echo "Starting public tunnel for host port $HOSTPORT (guest port $PUBPORT) ..."
+            nohup bore local $HOSTPORT --to bore.pub > bore_pub_log.log 2>&1 &
             sleep 5
             PUBURL=$(grep -Eo 'bore\.pub:[0-9]+' bore_pub_log.log | tail -n1)
             if [ -n "$PUBURL" ]; then
@@ -750,77 +783,64 @@ jobs:
       - name: Compressing and uploading the QCOW2 file
         if: ${{ always() && !cancelled() }}
         continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           UPLOAD_QCOW2="${{ github.event.inputs.upload_qcow2 }}"
           VM="${{ github.event.inputs.vm_name }}"
-          sudo pkill -9 qemu || true
-          if [[ "$UPLOAD_QCOW2" == "yes" && -n "$MEGA_EMAIL" ]]; then
+          TAG="state-${VM}"
+          DOWNLOAD_LINK=""
 
-            echo "::add-mask::$MEGA_EMAIL"
-            echo "::add-mask::$MEGA_PASSWORD"
-            DATE=$(date +%Y%m%d-%H%M)
-            TARGET_FILE="${VM}-${DATE}.7z"
-            TARGET_PATH="/mnt/$TARGET_FILE"
-            echo "Compressing QCOW2 file to 7z..."
-            sudo 7z a -t7z -mx=5 "$TARGET_PATH" "/mnt/${VM}.qcow2"
+          echo "Requesting ACPI shutdown of the guest..."
+          echo "system_powerdown" | nc -q 1 localhost 4444 >/dev/null 2>&1 || true
+          for i in $(seq 1 60); do
+            if ! pgrep -f "qemu-system-x86_64" >/dev/null; then break; fi
+            sleep 1
+          done
+          sudo pkill -9 -f qemu-system-x86_64 || true
+          sleep 2
 
-            echo "Setting up MegaTools configuration file..."
-            printf '[Login]\nUsername = %s\nPassword = %s\n' "$MEGA_EMAIL" "$MEGA_PASSWORD" > .megarc
-            sudo cp .megarc /root/.megarc
-            sudo cp .megarc /mnt
+          if [[ "$UPLOAD_QCOW2" == "yes" && -f "/mnt/${VM}.qcow2" ]]; then
+            echo "Compacting the disk image (drops unused clusters)..."
+            sudo qemu-img convert -O qcow2 "/mnt/${VM}.qcow2" "/mnt/${VM}-compact.qcow2" || true
+            if [ -f "/mnt/${VM}-compact.qcow2" ]; then sudo mv "/mnt/${VM}-compact.qcow2" "/mnt/${VM}.qcow2"; fi
 
-            mega_retry() {
-              local n=1
-              until "$@"; do
-                if [ "$n" -ge 4 ]; then return 1; fi
-                echo "MEGA call failed (attempt $n) - retrying in $((n*45))s..."
-                sleep $((n*45))
-                n=$((n+1))
-              done
-            }
+            DATE=$(date -u +%Y%m%d-%H%M)
+            BASE="${VM}-${DATE}.7z"
+            sudo rm -f "/mnt/${VM}-"[0-9]*.7z*
+            echo "Compressing QCOW2 in 1800 MB volumes..."
+            sudo 7z a -t7z -mx=3 -v1800m "/mnt/${BASE}" "/mnt/${VM}.qcow2" >/dev/null
+            sudo chown "$(id -u):$(id -g)" /mnt/"${VM}-${DATE}.7z".* 2>/dev/null || true
+            ls -lh /mnt/"${VM}-${DATE}.7z".* | awk '{print $9, $5}'
 
-            echo " list /mnt files "
-            ls -lh /mnt | grep -E '\.7z$|\.qcow2$|\.iso$' | awk '{print $9, $5}' || true
-            echo " uploading qcow2 file to mega"
-            UPLOAD_OK=no
-            if mega_retry sudo megaput "$TARGET_PATH" --path /Root; then
-              UPLOAD_OK=yes
-            fi
-
-            DOWNLOAD_LINK=""
-            if [[ "$UPLOAD_OK" == "yes" ]]; then
-              echo "getting the download link"
-              for i in 1 2 3; do
-                DOWNLOAD_LINK=$(sudo megaexport /Root/"${TARGET_FILE}" 2>/dev/null | grep -Eo 'https://mega\.nz/[^ ]+' | tail -n1)
-                if [ -n "$DOWNLOAD_LINK" ]; then break; fi
-                sleep 20
-              done
-            fi
-
-            if [ -n "$DOWNLOAD_LINK" ]; then
-              echo "::add-mask::$DOWNLOAD_LINK"
-              echo "Download link: $DOWNLOAD_LINK"
+            echo "Publishing checkpoint to GitHub release tag ${TAG}..."
+            gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
+              --title "Vortax state: ${VM}" \
+              --notes "Rolling disk checkpoints for ${VM}. The newest timestamp is the current state." >/dev/null
+            if gh release upload "$TAG" /mnt/"${VM}-${DATE}.7z".* --clobber; then
+              DOWNLOAD_LINK="release:${TAG}"
+              echo "State saved as release assets under tag ${TAG} (${DATE})."
               echo "DOWNLOAD_LINK=$DOWNLOAD_LINK" >> $GITHUB_ENV
               echo "$DOWNLOAD_LINK" > disk_link.txt
-              echo "Pruning older disk archives from MEGA (free quota is 20 GB)..."
-              OLD_ARCHIVES=$(sudo megals /Root 2>/dev/null | grep -E "/${VM}-[0-9]{8}-[0-9]{4}\.7z$" | grep -v "/${TARGET_FILE}$" || true)
-              if [ -n "$OLD_ARCHIVES" ]; then
-                echo "$OLD_ARCHIVES" | sed 's/^/  removing /'
-                echo "$OLD_ARCHIVES" | xargs -r sudo megarm > /dev/null 2>&1 || true
-              fi
+              echo "Pruning older checkpoints..."
+              gh release view "$TAG" --json assets -q '.assets[].name' \
+                | grep -E "^${VM}-[0-9]{8}-[0-9]{4}\.7z" \
+                | grep -v "^${VM}-${DATE}\.7z" \
+                | while read -r a; do gh release delete-asset "$TAG" "$a" -y >/dev/null 2>&1 || true; done
             else
-              echo "::warning title=MEGA upload failed::Could not upload/save the disk this run (e.g. MEGA EBLOCKED)."
-              if [[ "${{ github.event.inputs.boot_mode }}" == "qcow2" ]]; then
-                PREV="${{ github.event.inputs.source_url }}"
-                if [[ "$PREV" == *"mega.nz"* ]]; then
-                  echo "::warning::Reusing the previous disk link so the next run keeps its state."
-                  echo "DOWNLOAD_LINK=$PREV" >> $GITHUB_ENV
-                  echo "$PREV" > disk_link.txt
-                fi
+              echo "::warning title=State upload failed::Could not publish the checkpoint to the GitHub release."
+            fi
+            sudo rm -f /mnt/"${VM}-${DATE}".7z.* || true
+          else
+            echo "Skipped uploading (upload_qcow2=$UPLOAD_QCOW2, disk=$([ -f "/mnt/${VM}.qcow2" ] && echo present || echo missing))."
+            if [[ "${{ github.event.inputs.boot_mode }}" == "qcow2" ]]; then
+              PREV="${{ github.event.inputs.source_url }}"
+              if [[ "$PREV" == release:* ]]; then
+                echo "::warning::Reusing the previous state tag so the next run keeps its state."
+                echo "DOWNLOAD_LINK=$PREV" >> $GITHUB_ENV
+                echo "$PREV" > disk_link.txt
               fi
             fi
-          else
-            echo "Skipped uploading (upload_qcow2=$UPLOAD_QCOW2, mega_account=${MEGA_EMAIL:-missing})."
           fi
 
       - name: Trigger next machine (loop)
