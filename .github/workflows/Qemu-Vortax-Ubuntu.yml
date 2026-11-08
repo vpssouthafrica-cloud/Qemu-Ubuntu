@@ -314,6 +314,7 @@ jobs:
       - name: Prepare files and disks
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           MODE="${{ github.event.inputs.boot_mode }}"
           SRC="${{ env.FINAL_SOURCE_URL }}"
@@ -344,7 +345,7 @@ jobs:
             echo "Restoring disk from GitHub release state: $TAG"
             sudo mkdir -p /mnt/dl
             cd /mnt/dl
-            gh release download "$TAG" --clobber
+            gh release download "$TAG" --repo "$GH_REPO" --clobber
             FIRST=$(ls -1 "${VM}"-*.7z.001 2>/dev/null | head -n1 || true)
             if [ -n "$FIRST" ]; then
               sudo 7z x -y "$FIRST" -o/mnt >/dev/null
