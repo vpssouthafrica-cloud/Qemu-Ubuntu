@@ -485,7 +485,7 @@ jobs:
                 -device usb-tablet,bus=ehci.0 \
                 -drive file=/mnt/virtio-win.iso,media=cdrom,if=none,id=cd1 \
                 -device ide-cd,bus=ide.1,drive=cd1 \
-                -name "$VM" &
+                -name "$VM" > /tmp/qemu.log 2>&1 &
             else
               sudo qemu-system-x86_64 \
                 -enable-kvm \
@@ -506,7 +506,7 @@ jobs:
                 -device usb-tablet,bus=ehci.0 \
                 -drive file=/mnt/virtio-win.iso,media=cdrom,if=none,id=cd1 \
                 -device ide-cd,bus=ide.1,drive=cd1 \
-                -name "$VM" &
+                -name "$VM" > /tmp/qemu.log 2>&1 &
             fi
           else
             if [ -f "$ISO_PATH" ]; then
@@ -528,7 +528,7 @@ jobs:
                 -device usb-tablet,bus=ehci.0 \
                 -drive file=/mnt/virtio-win.iso,media=cdrom,if=none,id=cd1 \
                 -device ide-cd,bus=ide.1,drive=cd1 \
-                -name "$VM" &
+                -name "$VM" > /tmp/qemu.log 2>&1 &
             else
               sudo qemu-system-x86_64 \
                 -enable-kvm \
@@ -547,13 +547,19 @@ jobs:
                 -device usb-tablet,bus=ehci.0 \
                 -drive file=/mnt/virtio-win.iso,media=cdrom,if=none,id=cd1 \
                 -device ide-cd,bus=ide.1,drive=cd1 \
-                -name "$VM" &
+                -name "$VM" > /tmp/qemu.log 2>&1 &
             fi
           fi
           VNC_PASS="${{ github.event.inputs.vnc_password }}"
-          while ! nc -z localhost 4444; do
+          for i in $(seq 1 90); do
+            if nc -z localhost 4444; then break; fi
             sleep 1
           done
+          if ! nc -z localhost 4444; then
+            echo "::error::QEMU did not start; see /tmp/qemu.log"
+            sudo tail -60 /tmp/qemu.log || true
+            exit 1
+          fi
           echo "change vnc password $VNC_PASS" | nc -q 1 localhost 4444
           echo "VNC password applied successfully!"
 
@@ -735,7 +741,7 @@ jobs:
           echo "Session ended after ${RUNTIME} minutes."
           
       - name: Compressing and uploading the QCOW2 file
-        if: always()
+        if: ${{ always() && !cancelled() }}
         continue-on-error: true
         run: |
           UPLOAD_QCOW2="${{ github.event.inputs.upload_qcow2 }}"
