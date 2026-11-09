@@ -442,9 +442,14 @@ jobs:
           fi
           echo "Creating cloud-init seed (console login ubuntu/runner)..."
           sudo apt-get install -y -qq cloud-image-utils > /dev/null 2>&1 || true
-          printf '%s\n' '#cloud-config' 'ssh_pwauth: true' 'chpasswd:' '  expire: false' '  list: |' '    ubuntu:runner' > /tmp/ci-user-data
+          printf '%s\n' '#cloud-config' 'ssh_pwauth: true' 'chpasswd:' '  expire: false' '  list: |' '    ubuntu:runner' 'runcmd:' '  - growpart /dev/sda 1 || true' '  - resize2fs /dev/sda1 || true' > /tmp/ci-user-data
           printf 'instance-id: %s-%s\nlocal-hostname: %s\n' "$VM" "$(date +%s)" "$VM" > /tmp/ci-meta-data
           sudo cloud-localds /mnt/seed.iso /tmp/ci-user-data /tmp/ci-meta-data
+
+          if [ -f "/mnt/${VM}.qcow2" ]; then
+            echo "Growing ${VM}.qcow2 to ${DISK}G (grow only)..."
+            sudo qemu-img resize "/mnt/${VM}.qcow2" "${DISK}G" || true
+          fi
 
           sudo rm -rf "$TEMP_PATH"
 
