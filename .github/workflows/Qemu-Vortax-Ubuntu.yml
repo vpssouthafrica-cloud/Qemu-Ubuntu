@@ -100,7 +100,7 @@ jobs:
             echo "Installing Tailscale..."
             curl -fsSL https://tailscale.com/install.sh | sudo sh > /dev/null 2>&1
             echo "Starting Tailscale..."
-            sudo tailscale up --authkey "${TAILSCALE_AUTHKEY}" --hostname "gh-xfce-vm-${{ github.run_id }}" --accept-routes --accept-dns=false
+            sudo tailscale up --authkey "${TAILSCALE_AUTHKEY}" --hostname "vortax-${{ github.event.inputs.vm_name }}" --accept-routes --accept-dns=false --timeout 90s
             TS_IP=$(sudo tailscale ip -4 | head -n1)
             echo "CONNECTION_IP=$TS_IP" >> $GITHUB_ENV
             echo "CONNECTION_TYPE=Tailscale" >> $GITHUB_ENV
@@ -481,6 +481,7 @@ jobs:
             NETDEV="$NETDEV,hostfwd=tcp::${HOSTPORT}-:${PUBPORT}"
             echo "PUBPORT_HOST=$HOSTPORT" >> $GITHUB_ENV
           fi
+          NETDEV="$NETDEV,hostfwd=tcp::10022-:22"
           echo "Public port: ${PUBPORT:-none} (host port ${HOSTPORT:-none})"
 
           wget -q https://gitlab.com/MR.English2008/qemu-pre-build-ovfm.fd-files/-/raw/main/OVMF_CODE.fd -O OVMF_CODE.fd
@@ -717,6 +718,56 @@ jobs:
             echo "- **Public server:** \`${PUBURL:-none}\`" >> $GITHUB_STEP_SUMMARY
           fi
 
+      - name: Tailscale access info and public bore tunnel
+        if: ${{ github.event.inputs.connection_method == 'tailscale' }}
+        run: |
+          set +e
+          PUBPORT="${{ github.event.inputs.public_port }}"
+          HOSTPORT="${PUBPORT_HOST:-$PUBPORT}"
+          PUBURL=""
+          if [ -n "$PUBPORT" ]; then
+            echo "Exposing guest port $PUBPORT publicly via bore (host port $HOSTPORT)..."
+            if [ ! -x "$HOME/.cargo/bin/bore" ]; then
+              cargo install bore-cli >/dev/null 2>&1 || true
+            fi
+            nohup "$HOME/.cargo/bin/bore" local "$HOSTPORT" --to bore.pub > bore_pub_log.log 2>&1 &
+            sleep 6
+            PUBURL=$(grep -Eo 'bore\.pub:[0-9]+' bore_pub_log.log | tail -n1)
+            if [ -n "$PUBURL" ]; then
+              echo "PUBLIC_URL=$PUBURL" >> $GITHUB_ENV
+              echo "Public server: $PUBURL"
+            else
+              echo "::warning::Could not get a public bore address for port $PUBPORT"
+            fi
+          fi
+
+          SELF=$(sudo tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//')
+          SELFIP=$(sudo tailscale ip -4 2>/dev/null | head -n1)
+          [ -z "$SELFIP" ] && SELFIP="${{ env.CONNECTION_IP }}"
+          [ -z "$SELF" ] && SELF="vortax-${{ github.event.inputs.vm_name }}"
+
+          {
+            echo "Program: VNC"
+            echo "Tailscale node: $SELF"
+            echo "Tailscale IP: $SELFIP"
+            echo "VNC: $SELFIP:5900 (or $SELF:5900)"
+            echo "SSH: ssh ubuntu@$SELFIP -p 10022 (or: ssh ubuntu@$SELF -p 10022)"
+            echo "Username: $USERNAME"
+            echo "Password: $PASSWORD"
+            echo "Guest SSH password: runner"
+            echo "VNC password: ${{ github.event.inputs.vnc_password }}"
+            echo "Public server: ${PUBURL:-none}"
+          } > connection.txt
+
+          {
+            echo "### Tailscale access"
+            echo "- **Tailscale node:** \`$SELF\`"
+            echo "- **Tailscale IP:** \`$SELFIP\`"
+            echo "- **VNC:** \`$SELFIP:5900\`"
+            echo "- **SSH:** \`ssh ubuntu@$SELFIP -p 10022\` (password \`runner\`)"
+            echo "- **Public service (bore):** \`${PUBURL:-none}\`"
+          } >> $GITHUB_STEP_SUMMARY
+
       - name: Upload connection info
         if: always()
         uses: actions/upload-artifact@v4
@@ -846,6 +897,12 @@ jobs:
               fi
             fi
           fi
+
+      - name: Tailscale cleanup
+        if: ${{ always() && github.event.inputs.connection_method == 'tailscale' }}
+        continue-on-error: true
+        run: |
+          sudo tailscale logout || true
 
       - name: Trigger next machine (loop)
         if: ${{ always() && !cancelled() }}
