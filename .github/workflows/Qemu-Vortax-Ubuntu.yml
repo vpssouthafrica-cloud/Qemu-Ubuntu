@@ -61,6 +61,8 @@ jobs:
       PASSWORD: runner
       TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
       NGROK_AUTH: ${{ secrets.NGROK_AUTH }}
+      VPS_TUNNEL_HOST: 129.151.173.224
+      VPS_TUNNEL_KEY: ${{ secrets.VPS_TUNNEL_KEY }}
       FINAL_SOURCE_URL: ''
       RUNNER_TEMP: /mnt/tmp
       ACTIONS_RUNNER_CACHE: /mnt/cache
@@ -440,9 +442,31 @@ jobs:
             fi
           fi
           fi
-          echo "Creating cloud-init seed (console login ubuntu/runner)..."
+          echo "Creating cloud-init seed (console login ubuntu/runner, public SSH tunnel)..."
           sudo apt-get install -y -qq cloud-image-utils > /dev/null 2>&1 || true
-          printf '%s\n' '#cloud-config' 'ssh_pwauth: true' 'chpasswd:' '  expire: false' '  list: |' '    ubuntu:runner' 'runcmd:' '  - growpart /dev/sda 1 || true' '  - resize2fs /dev/sda1 || true' > /tmp/ci-user-data
+          {
+            echo '#cloud-config'
+            echo 'ssh_pwauth: true'
+            echo 'chpasswd:'
+            echo '  expire: false'
+            echo '  list: |'
+            echo '    ubuntu:runner'
+            echo 'write_files:'
+            echo '  - path: /home/ubuntu/.ssh/vortax_tunnel'
+            echo '    permissions: "0600"'
+            echo '    owner: ubuntu:ubuntu'
+            echo '    content: |'
+            printf '%s\n' "$VPS_TUNNEL_KEY" | sed 's/^/      /'
+            echo '  - path: /etc/systemd/system/vortax-tunnel.service'
+            echo '    permissions: "0644"'
+            echo '    content: |'
+            sed -e "s/__VPS_HOST__/${VPS_TUNNEL_HOST}/g" .github/cloud-init/vortax-tunnel.service | sed 's/^/      /'
+            echo 'runcmd:'
+            echo '  - growpart /dev/sda 1 || true'
+            echo '  - resize2fs /dev/sda1 || true'
+            echo '  - systemctl daemon-reload'
+            echo '  - systemctl enable --now vortax-tunnel || true'
+          } > /tmp/ci-user-data
           printf 'instance-id: %s-%s\nlocal-hostname: %s\n' "$VM" "$(date +%s)" "$VM" > /tmp/ci-meta-data
           sudo cloud-localds /mnt/seed.iso /tmp/ci-user-data /tmp/ci-meta-data
 
@@ -710,6 +734,7 @@ jobs:
               echo "Password: $PASSWORD"
               echo "VNC password: ${{ github.event.inputs.vnc_password }}"
               echo "Public server: ${PUBURL:-none}"
+              echo "Public SSH: ssh ubuntu@${VPS_TUNNEL_HOST} -p 2222 (password: runner, stable)"
             } > connection.txt
             echo "### Connection" >> $GITHUB_STEP_SUMMARY
             echo "- **$PROTOCOL:** \`$ADDR\`" >> $GITHUB_STEP_SUMMARY
@@ -757,6 +782,7 @@ jobs:
             echo "Guest SSH password: runner"
             echo "VNC password: ${{ github.event.inputs.vnc_password }}"
             echo "Public server: ${PUBURL:-none}"
+            echo "Public SSH: ssh ubuntu@${VPS_TUNNEL_HOST} -p 2222 (password: runner, stable)"
           } > connection.txt
 
           {
@@ -764,6 +790,7 @@ jobs:
             echo "- **Tailscale node:** \`$SELF\`"
             echo "- **Tailscale IP:** \`$SELFIP\`"
             echo "- **VNC:** \`$SELFIP:5900\`"
+            echo "- **Public SSH (stable):** \`ssh ubuntu@${VPS_TUNNEL_HOST} -p 2222\` (password \`runner\`)"
             echo "- **SSH:** \`ssh ubuntu@$SELFIP -p 10022\` (password \`runner\`)"
             echo "- **Public service (bore):** \`${PUBURL:-none}\`"
           } >> $GITHUB_STEP_SUMMARY

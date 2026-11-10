@@ -1,0 +1,13 @@
+[Unit]
+Description=Reverse SSH tunnel to public VPS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+ExecStart=/usr/bin/ssh -N -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=20 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -i /home/ubuntu/.ssh/vortax_tunnel -R 0.0.0.0:2222:localhost:22 opc@__VPS_HOST__
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
