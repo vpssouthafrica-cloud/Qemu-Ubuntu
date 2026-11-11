@@ -641,6 +641,45 @@ jobs:
           echo "=== guest serial log (last 25 lines) ==="
           sudo tail -25 /tmp/serial.log 2>/dev/null || echo "(no serial log)"
 
+
+      - name: Ensure guest reverse tunnel (2222)
+        run: |
+          sudo timeout 240 apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=20 install -y -qq sshpass > /dev/null 2>&1 || true
+          echo "Waiting for guest SSH on 127.0.0.1:10022..."
+          for i in $(seq 1 100); do
+            timeout 2 bash -c '</dev/tcp/127.0.0.1/10022' 2>/dev/null && break
+            sleep 3
+          done
+          {
+            echo 'set -e'
+            echo 'install -d -m 700 -o ubuntu -g ubuntu /home/ubuntu/.ssh'
+            echo 'cat > /home/ubuntu/.ssh/vortax_tunnel <<"KEYEOF"'
+            printf '%s\n' "$VPS_TUNNEL_KEY"
+            echo 'KEYEOF'
+            echo 'chown ubuntu:ubuntu /home/ubuntu/.ssh/vortax_tunnel'
+            echo 'chmod 600 /home/ubuntu/.ssh/vortax_tunnel'
+            echo 'cat > /etc/systemd/system/vortax-tunnel.service <<"UNITEOF"'
+            sed -e "s|__VPS_HOST__|${VPS_TUNNEL_HOST}|g" .github/cloud-init/vortax-tunnel.service
+            echo 'UNITEOF'
+            echo 'systemctl daemon-reload'
+            echo 'systemctl enable vortax-tunnel'
+            echo 'systemctl restart vortax-tunnel'
+            echo 'sleep 3'
+            echo 'systemctl is-active vortax-tunnel'
+            echo "timeout 6 bash -c '</dev/tcp/${VPS_TUNNEL_HOST}/22' && echo VPS-REACHABLE || echo VPS-UNREACHABLE"
+          } > /tmp/vortax-bootstrap.sh
+          ok=0
+          for i in $(seq 1 8); do
+            if sshpass -p runner ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                 -o ConnectTimeout=10 -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+                 -p 10022 ubuntu@127.0.0.1 'sudo -n bash -s' < /tmp/vortax-bootstrap.sh; then ok=1; break; fi
+            echo "guest ssh attempt $i failed, retrying..."
+            sleep 10
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::warning title=Guest tunnel::Could not install the tunnel via guest SSH; cloud-init may already have done it."
+          fi
+
       - name: Create desktop VNC launcher
         run: |
           DESKTOP_PATH="/home/${USERNAME}/Desktop"
@@ -865,11 +904,25 @@ jobs:
           if [ -n "$PUBLIC_URL" ]; then
             echo ">>> Public server: $PUBLIC_URL"
           fi
-          echo "Keeping the session alive for ${RUNTIME} minutes..."
+          echo "Keeping the session alive for ${RUNTIME} minutes (tunnel supervised)..."
           if [[ "$UPLOAD_QCOW2" == "yes" && "$RUNTIME" -gt 270 ]]; then
               RUNTIME=270
           fi
-          sleep $((RUNTIME * 60))
+          i=0
+          while [ "$i" -lt "$RUNTIME" ]; do
+            if [ $((i % 5)) -eq 0 ] && [ -f /tmp/vortax-bootstrap.sh ]; then
+              if ! sshpass -p runner ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                     -o ConnectTimeout=10 -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+                     -p 10022 ubuntu@127.0.0.1 'systemctl is-active --quiet vortax-tunnel' >/dev/null 2>&1; then
+                echo "$(date -u +%H:%M:%S) tunnel down - reinstalling inside guest"
+                sshpass -p runner ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                  -o ConnectTimeout=10 -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+                  -p 10022 ubuntu@127.0.0.1 'sudo -n bash -s' < /tmp/vortax-bootstrap.sh || true
+              fi
+            fi
+            sleep 60
+            i=$((i + 1))
+          done
           echo "Session ended after ${RUNTIME} minutes."
           
       - name: Compressing and uploading the QCOW2 file
