@@ -70,9 +70,23 @@ jobs:
       FINAL_SOURCE_URL: ''
       RUNNER_TEMP: /mnt/tmp
       ACTIONS_RUNNER_CACHE: /mnt/cache
+      AGE_RECIPIENT: age1dxxn0hztaf00zafvmvne2h6wmud6wvh3enehcps279xla7fzqy8se90u0e
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Prepare state encryption key
+        env:
+          AGE_KEY: ${{ secrets.AGE_KEY }}
+        run: |
+          if [ -z "${AGE_KEY:-}" ]; then
+            echo "::warning title=AGE_KEY missing::Checkpoints will not be saved; add the AGE_KEY secret (age private key)."
+            exit 0
+          fi
+          umask 077
+          printf '%s\n' "$AGE_KEY" > /tmp/age.key
+          chmod 600 /tmp/age.key
+          echo "AGE_KEY_FILE=/tmp/age.key" >> "$GITHUB_ENV"
 
       - name: Free disk space
         run: |
@@ -219,7 +233,7 @@ jobs:
             /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
           sudo timeout 240 apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=20 -o Acquire::Retries=2 update -qq > /dev/null 2>&1 || true
           echo "Installing QEMU + components..."
-          sudo DEBIAN_FRONTEND=noninteractive timeout 600 apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=20 -o Acquire::Retries=2 install -y -qq qemu-system-x86 ovmf novnc websockify wget curl unzip p7zip-full unrar-free tar zstd python3-pip > /dev/null 2>&1
+          sudo DEBIAN_FRONTEND=noninteractive timeout 600 apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=20 -o Acquire::Retries=2 install -y -qq qemu-system-x86 ovmf novnc websockify wget curl unzip p7zip-full unrar-free tar zstd age python3-pip > /dev/null 2>&1
           echo "Installing internetarchive..."
           pip install internetarchive > /dev/null 2>&1
           echo "Cloning badown..."
@@ -360,9 +374,17 @@ jobs:
             cd /mnt/dl
             gh release view "$TAG" --repo "$GH_REPO" --json assets -q '.assets[].name' \
               | xargs -P 6 -I{} gh release download "$TAG" --repo "$GH_REPO" --clobber -p "{}"
+            AFIRST=$(ls -1 "${VM}"-*.qcow2.zst.age.001 2>/dev/null | head -n1 || true)
             ZFIRST=$(ls -1 "${VM}"-*.qcow2.zst.001 2>/dev/null | head -n1 || true)
-            if [ -n "$ZFIRST" ]; then
-              cat "${VM}"-*.qcow2.zst.* | sudo zstd -d -T0 -q -o "/mnt/${VM}.qcow2"
+            if [ -n "$AFIRST" ]; then
+              if [ -z "${AGE_KEY_FILE:-}" ]; then
+                echo "::error::Encrypted checkpoint found but the AGE_KEY secret is missing."
+                exit 1
+              fi
+              echo "Decrypting encrypted checkpoint..."
+              cat "${VM}"-*.qcow2.zst.age.* | age -d -i "$AGE_KEY_FILE" | sudo zstd -d -T0 -q -o "/mnt/${VM}.qcow2" || true
+            elif [ -n "$ZFIRST" ]; then
+              cat "${VM}"-*.qcow2.zst.* | sudo zstd -d -T0 -q -o "/mnt/${VM}.qcow2" || true
             else
               FIRST=$(ls -1 "${VM}"-*.7z.001 2>/dev/null | head -n1 || true)
               if [ -n "$FIRST" ]; then
@@ -375,6 +397,9 @@ jobs:
             if [ ! -f "/mnt/${VM}.qcow2" ]; then
               echo "::error::Could not restore ${VM}.qcow2 from release tag $TAG"
               exit 1
+            fi
+            if [[ -n "$AFIRST" || -n "$ZFIRST" ]]; then
+              sudo qemu-img info "/mnt/${VM}.qcow2" >/dev/null 2>&1 || { echo "::error::Restored image failed qemu-img verification"; exit 1; }
             fi
             echo "Restored /mnt/${VM}.qcow2 from release tag $TAG"
             DIRECT=yes
@@ -957,35 +982,40 @@ jobs:
             if [ -f "/mnt/${VM}-compact.qcow2" ]; then sudo mv "/mnt/${VM}-compact.qcow2" "/mnt/${VM}.qcow2"; fi
 
             DATE=$(date -u +%Y%m%d-%H%M)
+            if [ -z "${AGE_KEY_FILE:-}" ] || [ -z "${AGE_RECIPIENT:-}" ]; then
+              echo "::error title=State not saved::AGE_KEY/AGE_RECIPIENT missing; refusing to publish an unencrypted disk."
+              exit 1
+            fi
             sudo rm -f "/mnt/${VM}-"[0-9]*.7z* "/mnt/${VM}-"[0-9]*.qcow2.zst*
-            echo "Compressing QCOW2 with zstd in 1800 MB volumes..."
-            sudo zstd -T0 -3 -q -f "/mnt/${VM}.qcow2" -o "/mnt/${VM}-${DATE}.qcow2.zst"
-            sudo split -b 1800M -d -a 3 "/mnt/${VM}-${DATE}.qcow2.zst" "/mnt/${VM}-${DATE}.qcow2.zst."
-            sudo rm -f "/mnt/${VM}-${DATE}.qcow2.zst"
-            sudo chown "$(id -u):$(id -g)" /mnt/"${VM}-${DATE}.qcow2.zst".* 2>/dev/null || true
-            ls -lh /mnt/"${VM}-${DATE}.qcow2.zst".* | awk '{print $9, $5}'
+            echo "Compressing (zstd) and encrypting (age) the QCOW2..."
+            sudo VM="$VM" DATE="$DATE" AGE_RECIPIENT="$AGE_RECIPIENT" sh -c \
+              'zstd -T0 -3 -q -c "/mnt/$VM.qcow2" | age -r "$AGE_RECIPIENT" -o "/mnt/$VM-$DATE.qcow2.zst.age"'
+            sudo split -b 1800M -d -a 3 "/mnt/${VM}-${DATE}.qcow2.zst.age" "/mnt/${VM}-${DATE}.qcow2.zst.age."
+            sudo rm -f "/mnt/${VM}-${DATE}.qcow2.zst.age"
+            sudo chown "$(id -u):$(id -g)" /mnt/"${VM}-${DATE}.qcow2.zst.age".* 2>/dev/null || true
+            ls -lh /mnt/"${VM}-${DATE}.qcow2.zst.age".* | awk '{print $9, $5}'
 
             echo "Publishing checkpoint to GitHub release tag ${TAG}..."
             gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
               --title "Vortax state: ${VM}" \
               --notes "Rolling disk checkpoints for ${VM}. The newest timestamp is the current state." >/dev/null
-            ls -1 /mnt/"${VM}-${DATE}.qcow2.zst".* | xargs -P 4 -I{} gh release upload "$TAG" "{}" --clobber
-            PARTS=$(ls -1 /mnt/"${VM}-${DATE}.qcow2.zst".* | wc -l)
-            UPLOADED=$(gh release view "$TAG" --json assets -q '.assets[].name' | grep -c "^${VM}-${DATE}\.qcow2\.zst\." || true)
+            ls -1 /mnt/"${VM}-${DATE}.qcow2.zst.age".* | xargs -P 4 -I{} gh release upload "$TAG" "{}" --clobber
+            PARTS=$(ls -1 /mnt/"${VM}-${DATE}.qcow2.zst.age".* | wc -l)
+            UPLOADED=$(gh release view "$TAG" --json assets -q '.assets[].name' | grep -c "^${VM}-${DATE}\.qcow2\.zst\.age\." || true)
             if [ "$PARTS" -gt 0 ] && [ "$UPLOADED" -eq "$PARTS" ]; then
               DOWNLOAD_LINK="release:${TAG}"
-              echo "State saved as release assets under tag ${TAG} (${DATE}, ${PARTS} parts)."
+              echo "State saved as encrypted release assets under tag ${TAG} (${DATE}, ${PARTS} parts)."
               echo "DOWNLOAD_LINK=$DOWNLOAD_LINK" >> $GITHUB_ENV
               echo "$DOWNLOAD_LINK" > disk_link.txt
               echo "Pruning older checkpoints..."
               gh release view "$TAG" --json assets -q '.assets[].name' \
-                | grep -E "^${VM}-[0-9]{8}-[0-9]{4}\.(7z|qcow2\.zst\.)" \
+                | grep -E "^${VM}-[0-9]{8}-[0-9]{4}\." \
                 | grep -v "^${VM}-${DATE}\." \
                 | while read -r a; do gh release delete-asset "$TAG" "$a" -y >/dev/null 2>&1 || true; done
             else
               echo "::warning title=State upload failed::Checkpoint parts ${UPLOADED}/${PARTS} present on the release."
             fi
-            sudo rm -f /mnt/"${VM}-${DATE}".qcow2.zst.* || true
+            sudo rm -f /mnt/"${VM}-${DATE}".qcow2.zst.age.* || true
           else
             echo "Skipped uploading (upload_qcow2=$UPLOAD_QCOW2, disk=$([ -f "/mnt/${VM}.qcow2" ] && echo present || echo missing))."
             if [[ "${{ github.event.inputs.boot_mode }}" == "qcow2" ]]; then
