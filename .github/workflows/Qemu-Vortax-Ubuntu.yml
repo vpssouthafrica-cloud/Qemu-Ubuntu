@@ -219,7 +219,7 @@ jobs:
             /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
           sudo timeout 240 apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=20 -o Acquire::Retries=2 update -qq > /dev/null 2>&1 || true
           echo "Installing QEMU + components..."
-          sudo DEBIAN_FRONTEND=noninteractive timeout 600 apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=20 -o Acquire::Retries=2 install -y -qq qemu-system-x86 ovmf novnc websockify wget curl unzip p7zip-full unrar-free tar python3-pip > /dev/null 2>&1
+          sudo DEBIAN_FRONTEND=noninteractive timeout 600 apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=20 -o Acquire::Retries=2 install -y -qq qemu-system-x86 ovmf novnc websockify wget curl unzip p7zip-full unrar-free tar zstd python3-pip > /dev/null 2>&1
           echo "Installing internetarchive..."
           pip install internetarchive > /dev/null 2>&1
           echo "Cloning badown..."
@@ -358,13 +358,19 @@ jobs:
             sudo mkdir -p /mnt/dl
             sudo chown "$(id -u):$(id -g)" /mnt/dl
             cd /mnt/dl
-            gh release download "$TAG" --repo "$GH_REPO" --clobber
-            FIRST=$(ls -1 "${VM}"-*.7z.001 2>/dev/null | head -n1 || true)
-            if [ -n "$FIRST" ]; then
-              sudo 7z x -y "$FIRST" -o/mnt >/dev/null
+            gh release view "$TAG" --repo "$GH_REPO" --json assets -q '.assets[].name' \
+              | xargs -P 6 -I{} gh release download "$TAG" --repo "$GH_REPO" --clobber -p "{}"
+            ZFIRST=$(ls -1 "${VM}"-*.qcow2.zst.001 2>/dev/null | head -n1 || true)
+            if [ -n "$ZFIRST" ]; then
+              cat "${VM}"-*.qcow2.zst.* | sudo zstd -d -T0 -q -o "/mnt/${VM}.qcow2"
             else
-              LAST=$(ls -1 "${VM}"-*.7z 2>/dev/null | head -n1 || true)
-              if [ -n "$LAST" ]; then sudo 7z x -y "$LAST" -o/mnt >/dev/null; fi
+              FIRST=$(ls -1 "${VM}"-*.7z.001 2>/dev/null | head -n1 || true)
+              if [ -n "$FIRST" ]; then
+                sudo 7z x -y "$FIRST" -o/mnt >/dev/null
+              else
+                LAST=$(ls -1 "${VM}"-*.7z 2>/dev/null | head -n1 || true)
+                if [ -n "$LAST" ]; then sudo 7z x -y "$LAST" -o/mnt >/dev/null; fi
+              fi
             fi
             if [ ! -f "/mnt/${VM}.qcow2" ]; then
               echo "::error::Could not restore ${VM}.qcow2 from release tag $TAG"
@@ -905,8 +911,8 @@ jobs:
             echo ">>> Public server: $PUBLIC_URL"
           fi
           echo "Keeping the session alive for ${RUNTIME} minutes (tunnel supervised)..."
-          if [[ "$UPLOAD_QCOW2" == "yes" && "$RUNTIME" -gt 270 ]]; then
-              RUNTIME=270
+          if [[ "$UPLOAD_QCOW2" == "yes" && "$RUNTIME" -gt 315 ]]; then
+              RUNTIME=315
           fi
           i=0
           while [ "$i" -lt "$RUNTIME" ]; do
@@ -951,31 +957,35 @@ jobs:
             if [ -f "/mnt/${VM}-compact.qcow2" ]; then sudo mv "/mnt/${VM}-compact.qcow2" "/mnt/${VM}.qcow2"; fi
 
             DATE=$(date -u +%Y%m%d-%H%M)
-            BASE="${VM}-${DATE}.7z"
-            sudo rm -f "/mnt/${VM}-"[0-9]*.7z*
-            echo "Compressing QCOW2 in 1800 MB volumes..."
-            sudo 7z a -t7z -mx=3 -v1800m "/mnt/${BASE}" "/mnt/${VM}.qcow2" >/dev/null
-            sudo chown "$(id -u):$(id -g)" /mnt/"${VM}-${DATE}.7z".* 2>/dev/null || true
-            ls -lh /mnt/"${VM}-${DATE}.7z".* | awk '{print $9, $5}'
+            sudo rm -f "/mnt/${VM}-"[0-9]*.7z* "/mnt/${VM}-"[0-9]*.qcow2.zst*
+            echo "Compressing QCOW2 with zstd in 1800 MB volumes..."
+            sudo zstd -T0 -3 -q -f "/mnt/${VM}.qcow2" -o "/mnt/${VM}-${DATE}.qcow2.zst"
+            sudo split -b 1800M -d -a 3 "/mnt/${VM}-${DATE}.qcow2.zst" "/mnt/${VM}-${DATE}.qcow2.zst."
+            sudo rm -f "/mnt/${VM}-${DATE}.qcow2.zst"
+            sudo chown "$(id -u):$(id -g)" /mnt/"${VM}-${DATE}.qcow2.zst".* 2>/dev/null || true
+            ls -lh /mnt/"${VM}-${DATE}.qcow2.zst".* | awk '{print $9, $5}'
 
             echo "Publishing checkpoint to GitHub release tag ${TAG}..."
             gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
               --title "Vortax state: ${VM}" \
               --notes "Rolling disk checkpoints for ${VM}. The newest timestamp is the current state." >/dev/null
-            if gh release upload "$TAG" /mnt/"${VM}-${DATE}.7z".* --clobber; then
+            ls -1 /mnt/"${VM}-${DATE}.qcow2.zst".* | xargs -P 4 -I{} gh release upload "$TAG" "{}" --clobber
+            PARTS=$(ls -1 /mnt/"${VM}-${DATE}.qcow2.zst".* | wc -l)
+            UPLOADED=$(gh release view "$TAG" --json assets -q '.assets[].name' | grep -c "^${VM}-${DATE}\.qcow2\.zst\." || true)
+            if [ "$PARTS" -gt 0 ] && [ "$UPLOADED" -eq "$PARTS" ]; then
               DOWNLOAD_LINK="release:${TAG}"
-              echo "State saved as release assets under tag ${TAG} (${DATE})."
+              echo "State saved as release assets under tag ${TAG} (${DATE}, ${PARTS} parts)."
               echo "DOWNLOAD_LINK=$DOWNLOAD_LINK" >> $GITHUB_ENV
               echo "$DOWNLOAD_LINK" > disk_link.txt
               echo "Pruning older checkpoints..."
               gh release view "$TAG" --json assets -q '.assets[].name' \
-                | grep -E "^${VM}-[0-9]{8}-[0-9]{4}\.7z" \
-                | grep -v "^${VM}-${DATE}\.7z" \
+                | grep -E "^${VM}-[0-9]{8}-[0-9]{4}\.(7z|qcow2\.zst\.)" \
+                | grep -v "^${VM}-${DATE}\." \
                 | while read -r a; do gh release delete-asset "$TAG" "$a" -y >/dev/null 2>&1 || true; done
             else
-              echo "::warning title=State upload failed::Could not publish the checkpoint to the GitHub release."
+              echo "::warning title=State upload failed::Checkpoint parts ${UPLOADED}/${PARTS} present on the release."
             fi
-            sudo rm -f /mnt/"${VM}-${DATE}".7z.* || true
+            sudo rm -f /mnt/"${VM}-${DATE}".qcow2.zst.* || true
           else
             echo "Skipped uploading (upload_qcow2=$UPLOAD_QCOW2, disk=$([ -f "/mnt/${VM}.qcow2" ] && echo present || echo missing))."
             if [[ "${{ github.event.inputs.boot_mode }}" == "qcow2" ]]; then
