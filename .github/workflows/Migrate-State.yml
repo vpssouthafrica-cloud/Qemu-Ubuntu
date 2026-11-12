@@ -1,0 +1,53 @@
+name: Migrate State (one-off)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: "Space-separated release tags to copy into the private state repo"
+        required: true
+        default: "state-ubuntu"
+
+permissions:
+  contents: read
+
+env:
+  STATE_REPO: vpssouthafrica-cloud/Qemu-State
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Copy release assets to the private state repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATE_PAT: ${{ secrets.STATE_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${STATE_PAT:-}" ]; then
+            echo "::error title=STATE_PAT missing::Add a fine-grained PAT with Contents read/write on ${STATE_REPO} as secret STATE_PAT."
+            exit 1
+          fi
+          sudo mkdir -p /mnt/migrate
+          sudo chown "$(id -u):$(id -g)" /mnt/migrate
+          for TAG in ${{ github.event.inputs.tags }}; do
+            D="/mnt/migrate/${TAG}"
+            rm -rf "$D"; mkdir -p "$D"
+            echo "== ${TAG}"
+            gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name' > "$D/.names"
+            if [ ! -s "$D/.names" ]; then echo "no assets for ${TAG}, skipping"; rm -rf "$D"; continue; fi
+            xargs -P 6 -I{} gh release download "$TAG" --repo "${{ github.repository }}" --clobber -D "$D" -p "{}" < "$D/.names"
+            if ! GH_TOKEN="$STATE_PAT" gh release view "$TAG" --repo "$STATE_REPO" >/dev/null 2>&1; then
+              GH_TOKEN="$STATE_PAT" gh release create "$TAG" --repo "$STATE_REPO" \
+                --title "VM state: ${TAG}" --notes "Private checkpoints (migrated)"
+            fi
+            ls -1 "$D" | grep -v '^\.names$' | xargs -P 4 -I{} \
+              env GH_TOKEN="$STATE_PAT" gh release upload "$TAG" "$D/{}" --repo "$STATE_REPO" --clobber
+            WANT=$(grep -c . "$D/.names")
+            GOT=$(GH_TOKEN="$STATE_PAT" gh release view "$TAG" --repo "$STATE_REPO" --json assets -q '.assets[].name' | grep -c . || true)
+            echo "${TAG}: ${GOT}/${WANT} assets now in ${STATE_REPO}"
+            if [ "${GOT}" -lt "${WANT}" ]; then echo "::error::Migration incomplete for ${TAG}"; exit 1; fi
+            rm -rf "$D"
+          done
+          echo "Migration finished. Keep the public releases until the next checkpoint lands in the private repo."
